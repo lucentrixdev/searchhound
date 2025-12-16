@@ -9,19 +9,27 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.BytesRef;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 
 public class PlainLuceneIndex {
     private final Directory directory;
     private final IndexWriter writer;
-    private final StandardAnalyzer analyzer;
+    private volatile IndexReader reader;
+    private volatile IndexSearcher searcher;
 
     public PlainLuceneIndex(String indexPath) throws Exception {
         this.directory = FSDirectory.open(Path.of(indexPath));
-        this.analyzer = new StandardAnalyzer();
+        StandardAnalyzer analyzer = new StandardAnalyzer();
         IndexWriterConfig config = new IndexWriterConfig(analyzer);
         this.writer = new IndexWriter(directory, config);
+        this.reader = null;
+        this.searcher = null;
+    }
+
+    public int numDocs() {
+        return writer.getDocStats().numDocs;
     }
 
     /**
@@ -46,39 +54,75 @@ public class PlainLuceneIndex {
             if (fields.containsKey(joinKeyField)) {
                 Object joinKey = fields.get(joinKeyField);
                 doc.add(new StringField("_join_key", joinKey.toString(), Field.Store.YES));
-                doc.add(new SortedDocValuesField("_join_key_dv", new BytesRef(joinKey.toString())));
+              //  doc.add(new SortedDocValuesField("_join_key_dv", new BytesRef(joinKey.toString())));
+                doc.add(new BinaryDocValuesField("_join_key_dv", new BytesRef(joinKey.toString())));
             }
 
             writer.addDocument(doc);
-            writer.commit();
+
+           // writer.flush();
         } catch (Exception e) {
             throw new RuntimeException("Indexing failed", e);
+        }
+    }
+
+    public void commit() {
+        try {
+            writer.commit();
+
+            refreshReader();
+        } catch (Exception e) {
+            throw new RuntimeException("Commit failed", e);
+        }
+
+    }
+
+    private void refreshReader() throws IOException {
+        if (reader != null) {
+            IndexReader newReader = DirectoryReader.openIfChanged((DirectoryReader) reader);
+            if (newReader != null) {
+                reader.close();
+                reader = newReader;
+                searcher = new IndexSearcher(reader);
+            }
+        }
+    }
+
+    private void ensureSearcher()   {
+        try {
+            if (searcher == null || reader == null) {
+                if (reader != null) {
+                    reader.close();
+                }
+                reader = DirectoryReader.open(directory);
+                searcher = new IndexSearcher(reader);
+            }
+        } catch (Exception ex) {
+            throw new RuntimeException("Error refreshing searcher", ex);
         }
     }
 
     /**
      * Search documents by join key using Bloom filter optimization
      */
-    public List<Document> searchByJoinKey(String joinKey, BloomFilter bloomFilter) {
+    public List<Document> searchByJoinKey(String joinKey, BloomFilter<String>  bloomFilter) {
+        // First check Bloom filter to avoid unnecessary searches
+        if (!bloomFilter.mightContain(joinKey)) {
+            return Collections.emptyList();
+        }
+
+        ensureSearcher();
+
         try {
-            IndexReader reader = DirectoryReader.open(directory);
-            IndexSearcher searcher = new IndexSearcher(reader);
-
-            // First check Bloom filter to avoid unnecessary searches
-            if (!bloomFilter.mightContain(joinKey)) {
-                return Collections.emptyList();
-            }
-
             // Search for documents with matching join key
             Query query = new TermQuery(new Term("_join_key", joinKey));
-            TopDocs topDocs = searcher.search(query, 1000);
+            TopDocs topDocs = searcher.search(query, 10000);
 
             List<Document> results = new ArrayList<>();
             for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
-                results.add(searcher.doc(scoreDoc.doc));
+                results.add(searcher.storedFields().document(scoreDoc.doc));
             }
 
-            reader.close();
             return results;
         } catch (Exception e) {
             throw new RuntimeException("Search failed", e);
@@ -90,7 +134,7 @@ public class PlainLuceneIndex {
      */
     public Set<String> extractJoinKeys(String joinKeyField) {
         try {
-            IndexReader reader = DirectoryReader.open(directory);
+            IndexReader reader = DirectoryReader.open(writer);
             Set<String> joinKeys = new HashSet<>();
 
             // Use DocValues for efficient join key extraction
@@ -110,6 +154,9 @@ public class PlainLuceneIndex {
     }
 
     public void close() throws Exception {
+        if (reader != null) {
+            reader.close();
+        }
         writer.close();
         directory.close();
     }

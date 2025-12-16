@@ -59,15 +59,15 @@ public class DistributedJoinCoordinator {
         }
 
         // Step 5: Collect and merge results
-        List<Map<String, Object>> finalResults = new ArrayList<>();
+        List<Map<String, Object>> partialResults = new ArrayList<>();
         for (Future<List<Document>> future : executor.invokeAll(probeTasks)) {
             for (Document doc : future.get()) {
-                finalResults.add(documentToMap(doc));
+                partialResults.add(documentToMap(doc));
             }
         }
 
         // Step 6: Perform final join semantics
-        return performFinalJoin(finalResults, buildSide, probeSide, joinKey);
+        return performFinalJoin(partialResults, buildSide, probeSide, joinKey);
     }
 
     private String chooseBuildSide(String left, String right) {
@@ -81,7 +81,11 @@ public class DistributedJoinCoordinator {
 
     private long estimateCollectionSize(String collection) {
         // Estimate based on sampling or statistics
-        return 0; // Placeholder
+        PlainLuceneIndex index = nodeServices.get(collection);
+        if(index == null) {
+            throw new RuntimeException("Index node is not found: "+collection);
+        }
+        return index.numDocs();
     }
 
     private List<PlainLuceneIndex> getServicesForCollection(String collection) {
@@ -103,10 +107,24 @@ public class DistributedJoinCoordinator {
             String probeSide,
             String joinKey) {
         // Implement final join logic (INNER, LEFT, etc.)
-        return partialResults;
+        // LEFT join by default
+        return partialResults.stream().filter(map -> buildSide.equals(map.get("class_name"))).toList();
     }
 
     public void registerNode(String nodeId, PlainLuceneIndex service) {
         nodeServices.put(nodeId, service);
+    }
+
+    public void close() {
+        for(PlainLuceneIndex index : nodeServices.values()) {
+            try {
+                index.close();
+            } catch (Exception ex) {
+                //NOP
+            }
+        }
+        nodeServices.clear();
+
+        executor.shutdownNow();
     }
 }
