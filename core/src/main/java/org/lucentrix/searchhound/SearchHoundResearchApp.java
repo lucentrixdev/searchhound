@@ -3,77 +3,113 @@ package org.lucentrix.searchhound;
 import org.apache.commons.io.FileUtils;
 import org.lucentrix.searchhound.core.DistributedJoinCoordinator;
 import org.lucentrix.searchhound.index.PlainLuceneIndex;
+import org.lucentrix.searchhound.topology.IndexCollection;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
+import java.util.Random;
 
 public class SearchHoundResearchApp {
+    static  final Random RND = new Random();
 
-    public static void main(String[] args) throws Exception {
+    private static void cleanup() {
         File indicesFolder = new File("data");
         if(indicesFolder.exists()) {
             try {
                 FileUtils.deleteDirectory(indicesFolder);
-                System.out.println("Directory and its contents deleted using Commons IO.");
+                System.out.println("Directory "+indicesFolder+" and its contents deleted using Commons IO.");
             } catch (IOException e) {
                 System.err.println("Failed to delete directory: " + e.getMessage());
             }
         }
-        // Initialize services
-        PlainLuceneIndex userService = new PlainLuceneIndex("data/indexes/users");
-        PlainLuceneIndex orderService = new PlainLuceneIndex("data/indexes/orders");
-
-        // Sample data indexing
-        indexSampleData(userService, orderService, 10);
-
-        // Initialize coordinator
-        DistributedJoinCoordinator coordinator = new DistributedJoinCoordinator();
-        coordinator.registerNode("user", userService);
-        coordinator.registerNode("order", orderService);
-
-        // Execute distributed join
-        List<Map<String, Object>> results = coordinator.executeDistributedJoin(
-                "user", "order", "user_id");
-
-        System.out.println("Join results count: " + results.size());
-
-        // Research metrics
-        collectResearchMetrics(coordinator);
-
-        coordinator.close();
     }
 
-    private static void indexSampleData(PlainLuceneIndex userService, PlainLuceneIndex orderService, int count) {
+    public static void main(String[] args) {
+        cleanup();
+
+        try {
+            int maxNodeSize = 100000;
+            // Initialize services
+            IndexCollection userCollection = new IndexCollection("user", List.of(
+                    new PlainLuceneIndex(Path.of("data/indexes/users1"), "user_id", maxNodeSize),
+                    new PlainLuceneIndex(Path.of("data/indexes/users2"), "user_id", maxNodeSize),
+                    new PlainLuceneIndex(Path.of("data/indexes/users3"), "user_id", maxNodeSize)
+            ));
+
+            IndexCollection orderCollection = new IndexCollection("order", List.of(
+                    new PlainLuceneIndex(Path.of("data/indexes/orders1"), "user_id", maxNodeSize),
+                    new PlainLuceneIndex(Path.of("data/indexes/orders2"), "user_id", maxNodeSize),
+                    new PlainLuceneIndex(Path.of("data/indexes/orders3"), "user_id", maxNodeSize)
+            ));
+
+
+            // Sample data indexing
+            indexSampleData(userCollection, orderCollection, 10000);
+
+            // Initialize coordinator
+            DistributedJoinCoordinator coordinator = new DistributedJoinCoordinator();
+            coordinator.register(userCollection);
+            coordinator.register(orderCollection);
+
+            // Execute distributed join
+            List<Map<String, Object>> results = coordinator.executeDistributedJoin(
+                    "user", "order", "user_id");
+
+            System.out.println("Join results count: " + results.size());
+
+            // Research metrics
+            collectResearchMetrics(coordinator);
+
+            coordinator.close();
+        } finally {
+            cleanup();
+        }
+
+        System.out.println("Search demo completed");
+    }
+
+    private static void indexSampleData(IndexCollection userCollection, IndexCollection orderCollection, int count) {
+        List<Map<String, Object>> users = new ArrayList<>();
+        List<Map<String, Object>> orders = new ArrayList<>();
+
         try {
             for (int i = 0; i < count; i++) {
-                // Index users
-                String userId = "U-"+ UUID.randomUUID();
-                String orderId = "O-"+ UUID.randomUUID();
+                String userId = "U-"+ RND.nextLong();
+                String orderId = "O-"+ RND.nextLong();
 
-                Map<String, Object> user = Map.of(
+                users.add(Map.of(
+                        "id", userId,
                         "user_id", userId,
                         "name", "Alice",
                         "email", "alice@example.com",
                         "class_name", "user"
-                );
-                userService.indexDocument(userId, user, "user_id");
-
-
-                // Index orders
-                Map<String, Object> order = Map.of(
+                ));
+                orders.add(Map.of(
+                        "id", orderId,
                         "order_id", orderId,
                         "user_id", userId,
                         "amount", 150.50,
                         "class_name", "order"
-                );
-                orderService.indexDocument(orderId, order, "user_id");
+                ));
+
+                if(i%1000 == 0) {
+                    userCollection.indexDocuments(users);
+                    users.clear();
+
+                    orderCollection.indexDocuments(orders);
+                    orders.clear();
+                }
             }
         } finally {
-            userService.commit();
-            orderService.commit();
+            userCollection.indexDocuments(users);
+            users.clear();
+
+            orderCollection.indexDocuments(orders);
+            orders.clear();
         }
     }
 

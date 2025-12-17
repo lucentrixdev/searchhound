@@ -1,21 +1,23 @@
 package org.lucentrix.searchhound.core;
 
-import com.google.common.hash.BloomFilter;
-import org.apache.lucene.index.IndexableField;
+import com.google.common.collect.Lists;
 import org.apache.lucene.document.Document;
-import org.lucentrix.searchhound.index.PlainLuceneIndex;
+import org.apache.lucene.index.IndexableField;
+import org.lucentrix.searchhound.topology.IndexCollection;
 
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 
 public class DistributedJoinCoordinator {
     private final ExecutorService executor;
-    private final Map<String, PlainLuceneIndex> nodeServices;
+    private final Map<String, IndexCollection> collections;
 
     public DistributedJoinCoordinator() {
         this.executor = Executors.newCachedThreadPool();
-        this.nodeServices = new ConcurrentHashMap<>();
+        this.collections = new ConcurrentHashMap<>();
     }
 
     /**
@@ -24,46 +26,22 @@ public class DistributedJoinCoordinator {
     public List<Map<String, Object>> executeDistributedJoin(
             String leftCollection,
             String rightCollection,
-            String joinKey) throws Exception {
+            String joinKey) {
 
         // Step 1: Choose build and probe sides based on cardinality
         String buildSide = chooseBuildSide(leftCollection, rightCollection);
         String probeSide = buildSide.equals(leftCollection) ? rightCollection : leftCollection;
 
-        // Step 2: Build phase - extract join keys from build side
-        Set<Future<Set<String>>> buildTasks = new HashSet<>();
-        for (PlainLuceneIndex service : getServicesForCollection(buildSide)) {
-            buildTasks.add(executor.submit(() -> service.extractJoinKeys(joinKey)));
-        }
+        IndexCollection buildCollection = getCollection(buildSide);
 
-        // Collect all join keys
-        Set<String> allJoinKeys = new HashSet<>();
-        for (Future<Set<String>> future : buildTasks) {
-            allJoinKeys.addAll(future.get());
-        }
+        IndexCollection probeCollection = getCollection(probeSide);
 
-        // Step 3: Create and broadcast Bloom filter
-        BloomFilter<String> bloomFilter = BloomFilterService.createFilter(allJoinKeys, 0.01);
+        Set<String> allJoinKeys = buildCollection.extractJoinKeys();
 
-        // Step 4: Probe phase - parallel execution on probe side
-        List<Callable<List<Document>>> probeTasks = new ArrayList<>();
-        for (PlainLuceneIndex service : getServicesForCollection(probeSide)) {
-            probeTasks.add(() -> {
-                // For each join key, search and return matching documents
-                List<Document> results = new ArrayList<>();
-                for (String key : allJoinKeys) {
-                    results.addAll(service.searchByJoinKey(key, bloomFilter));
-                }
-                return results;
-            });
-        }
-
-        // Step 5: Collect and merge results
         List<Map<String, Object>> partialResults = new ArrayList<>();
-        for (Future<List<Document>> future : executor.invokeAll(probeTasks)) {
-            for (Document doc : future.get()) {
-                partialResults.add(documentToMap(doc));
-            }
+        for(List<String> joinKeyPartition : Lists.partition(new ArrayList<>(allJoinKeys), 1000)) {
+            partialResults.addAll(buildCollection.searchByJoinKeys(joinKeyPartition));
+            partialResults.addAll(probeCollection.searchByJoinKeys(joinKeyPartition));
         }
 
         // Step 6: Perform final join semantics
@@ -81,16 +59,16 @@ public class DistributedJoinCoordinator {
 
     private long estimateCollectionSize(String collection) {
         // Estimate based on sampling or statistics
-        PlainLuceneIndex index = nodeServices.get(collection);
-        if(index == null) {
-            throw new RuntimeException("Index node is not found: "+collection);
+        IndexCollection index = collections.get(collection);
+        if (index == null) {
+            throw new RuntimeException("Index node is not found: " + collection);
         }
         return index.numDocs();
     }
 
-    private List<PlainLuceneIndex> getServicesForCollection(String collection) {
-        // Return all services hosting this collection
-        return new ArrayList<>(nodeServices.values()); // Simplified
+    private IndexCollection getCollection(String name) {
+
+        return collections.get(name);
     }
 
     private Map<String, Object> documentToMap(Document doc) {
@@ -111,19 +89,19 @@ public class DistributedJoinCoordinator {
         return partialResults.stream().filter(map -> buildSide.equals(map.get("class_name"))).toList();
     }
 
-    public void registerNode(String nodeId, PlainLuceneIndex service) {
-        nodeServices.put(nodeId, service);
+    public void register(IndexCollection collection) {
+        collections.put(collection.getName(), collection);
     }
 
     public void close() {
-        for(PlainLuceneIndex index : nodeServices.values()) {
+        for (IndexCollection collection : collections.values()) {
             try {
-                index.close();
+                collection.close();
             } catch (Exception ex) {
                 //NOP
             }
         }
-        nodeServices.clear();
+        collections.clear();
 
         executor.shutdownNow();
     }
